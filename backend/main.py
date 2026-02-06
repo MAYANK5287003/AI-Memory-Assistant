@@ -5,7 +5,9 @@ from sqlalchemy import text
 from pathlib import Path
 import numpy as np
 
-# ---------- EXISTING MODULES ----------
+# =========================
+# CORE MODULES
+# =========================
 from db import engine
 from ai import get_embedding
 from text_cleaner import clean_text
@@ -13,8 +15,12 @@ from file_text_extractor import (
     extract_text_from_pdf,
     extract_text_from_excel,
 )
+from faiss_index import search_faiss
+from layout_ocr import extract_ocr_chunks
 
-# ---------- FACE MEMORY (PHASE 4) ----------
+# =========================
+# FACE MEMORY (PHASE 4)
+# =========================
 from face_detection import detect_and_crop_faces
 from face_embedding import get_face_embedding
 from face_index import (
@@ -22,10 +28,16 @@ from face_index import (
     add_face_embedding,
     search_similar_faces,
 )
-from face_clustering import cluster_face_embeddings
 from label_propagation import LabelPropagation
 
-# ---------- APP SETUP ----------
+# =========================
+# SMART QUERY ROUTER
+# =========================
+from query_router import SmartQueryRouter, QueryRoute
+
+# =========================
+# APP SETUP
+# =========================
 app = FastAPI()
 
 app.add_middleware(
@@ -36,10 +48,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- INIT MEMORY SYSTEMS ----------
-# Text FAISS already handled in your faiss_index module
+# =========================
+# INIT SYSTEMS
+# =========================
 face_index = load_index()
 label_manager = LabelPropagation()
+query_router = SmartQueryRouter()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "storage" / "uploads"
@@ -48,15 +62,16 @@ FACE_IMG_DIR = BASE_DIR / "storage" / "face_images"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 FACE_IMG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------- BASIC ROUTE ----------
+# =========================
+# BASIC ROUTE
+# =========================
 @app.get("/")
 def home():
-    return {"message": "AI Memory Assistant backend running"}
+    return {"message": "AI Memory Assistant running (Phases 1–5)"}
 
-# ======================================================
-#                    TEXT MEMORY
-# ======================================================
-
+# =========================
+# TEXT MEMORY
+# =========================
 class MemoryRequest(BaseModel):
     content: str
 
@@ -64,175 +79,89 @@ class MemoryRequest(BaseModel):
 def add_memory(request: MemoryRequest):
     with engine.connect() as conn:
         conn.execute(
-            text("INSERT INTO memories (content) VALUES (:content)"),
-            {"content": request.content},
+            text("INSERT INTO memories (content) VALUES (:c)"),
+            {"c": request.content},
         )
         conn.commit()
     return {"status": "memory saved"}
 
-# ---------- SEMANTIC SEARCH (TEXT) ----------
-@app.get("/search")
-def search_memory(query: str):
+def text_search_pipeline(query: str):
     query_vec = np.array(get_embedding(query)).astype("float32")
-
-    from faiss_index import search_faiss
     memory_ids = search_faiss(query, top_k=5)
-
-    if not memory_ids:
-        return {"query": query, "best_match": None}
 
     best_score = -1
     best_text = None
 
     with engine.connect() as conn:
-        for mem_id in memory_ids:
+        for mid in memory_ids:
             row = conn.execute(
-                text("SELECT content FROM memories WHERE id = :id"),
-                {"id": mem_id},
+                text("SELECT content FROM memories WHERE id=:id"),
+                {"id": mid},
             ).fetchone()
-
             if not row:
                 continue
-
-            mem_text = row[0]
-            mem_vec = np.array(get_embedding(mem_text)).astype("float32")
-
-            score = np.dot(query_vec, mem_vec) / (
-                np.linalg.norm(query_vec) * np.linalg.norm(mem_vec)
+            vec = np.array(get_embedding(row[0])).astype("float32")
+            score = np.dot(query_vec, vec) / (
+                np.linalg.norm(query_vec) * np.linalg.norm(vec)
             )
-
             if score > best_score:
                 best_score = score
-                best_text = mem_text
+                best_text = row[0]
 
-    if best_score < 0.35:
-        return {
-            "query": query,
-            "best_match": "I don’t have enough information to answer this yet."
-        }
+    return best_text or "I don’t have enough information yet."
 
-    return {"query": query, "best_match": best_text}
-
-# ======================================================
-#                    FILE UPLOAD
-# ======================================================
-
+# =========================
+# FILE UPLOAD (PDF / EXCEL / IMAGE OCR)
+# =========================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     file_path = UPLOAD_DIR / file.filename
-
     with open(file_path, "wb") as f:
         f.write(await file.read())
 
-    filename_lower = file.filename.lower()
-    if filename_lower.endswith(".pdf"):
-        file_type = "pdf"
-        extracted_text = extract_text_from_pdf(str(file_path))
-    elif filename_lower.endswith((".xls", ".xlsx")):
-        file_type = "excel"
-        extracted_text = extract_text_from_excel(str(file_path))
+    name = file.filename.lower()
+
+    texts = []
+
+    if name.endswith(".pdf"):
+        texts.append(extract_text_from_pdf(str(file_path)))
+
+    elif name.endswith((".xls", ".xlsx")):
+        texts.append(extract_text_from_excel(str(file_path)))
+
     else:
-        file_type = "image"
-        extracted_text = ""
+        ocr_chunks = extract_ocr_chunks(str(file_path))
+        texts.extend([c["content"] for c in ocr_chunks])
 
     with engine.connect() as conn:
-        result = conn.execute(
-            text("""
-                INSERT INTO documents (filename, file_path, file_type)
-                VALUES (:filename, :file_path, :file_type)
-                RETURNING id
-            """),
-            {
-                "filename": file.filename,
-                "file_path": str(file_path),
-                "file_type": file_type,
-            },
-        )
-        document_id = result.scalar()
+        for t in texts:
+            t = clean_text(t)
+            if len(t) > 20:
+                conn.execute(
+                    text("INSERT INTO memories (content) VALUES (:c)"),
+                    {"c": t},
+                )
         conn.commit()
 
-    cleaned_text = clean_text(extracted_text)
+    return {"status": "file processed", "chunks_added": len(texts)}
 
-    if cleaned_text:
-        with engine.connect() as conn:
-            mem_id = conn.execute(
-                text("INSERT INTO memories (content) VALUES (:c) RETURNING id"),
-                {"c": cleaned_text},
-            ).scalar()
+# =========================
+# SMART QUERY
+# =========================
+class SmartQueryRequest(BaseModel):
+    query: str
 
-            conn.execute(
-                text("""
-                    INSERT INTO document_memories (document_id, memory_id)
-                    VALUES (:d, :m)
-                """),
-                {"d": document_id, "m": mem_id},
-            )
-            conn.commit()
+@app.post("/smart-query")
+def smart_query(request: SmartQueryRequest):
+    route = query_router.detect_route(request.query)
+
+    if route in (QueryRoute.TEXT, QueryRoute.OCR, QueryRoute.HYBRID):
+        return {
+            "route": route.name,
+            "answer": text_search_pipeline(request.query)
+        }
 
     return {
-        "status": "file uploaded",
-        "filename": file.filename,
-        "document_id": document_id,
+        "route": "FACE",
+        "message": "Please upload an image for face search"
     }
-
-# ======================================================
-#                  FACE MEMORY (PHASE 4)
-# ======================================================
-
-@app.post("/face/upload")
-async def upload_face_image(file: UploadFile = File(...)):
-    image_path = FACE_IMG_DIR / file.filename
-
-    with open(image_path, "wb") as f:
-        f.write(await file.read())
-
-    faces = detect_and_crop_faces(str(image_path))
-    if not faces:
-        return {"status": "no face detected"}
-
-    added = []
-    for face in faces:
-        emb = get_face_embedding(face["face_path"])
-        if emb is None:
-            continue
-        add_face_embedding(face_index, face["face_id"], emb)
-        added.append(face["face_id"])
-
-    return {"status": "faces indexed", "count": len(added)}
-
-@app.post("/face/search")
-async def search_face(file: UploadFile = File(...)):
-    query_path = FACE_IMG_DIR / f"query_{file.filename}"
-
-    with open(query_path, "wb") as f:
-        f.write(await file.read())
-
-    faces = detect_and_crop_faces(str(query_path))
-    if not faces:
-        return {"status": "no face detected"}
-
-    emb = get_face_embedding(faces[0]["face_path"])
-    results = search_similar_faces(face_index, emb, top_k=10)
-
-    return {"matches": results}
-
-# ---------- LABEL MANAGEMENT ----------
-
-class LabelRequest(BaseModel):
-    cluster_id: int
-    label: str
-
-@app.post("/face/label")
-def set_label(req: LabelRequest):
-    label_manager.set_label(req.cluster_id, req.label)
-    return {"status": "label assigned"}
-
-@app.post("/face/label/rename")
-def rename_label(req: LabelRequest):
-    label_manager.rename_label(req.cluster_id, req.label)
-    return {"status": "label renamed"}
-
-@app.post("/face/label/remove")
-def remove_label(cluster_id: int):
-    label_manager.remove_label(cluster_id)
-    return {"status": "label removed"}
