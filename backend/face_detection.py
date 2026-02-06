@@ -5,12 +5,18 @@ from mtcnn import MTCNN
 from PIL import Image
 import uuid
 import os
+from pathlib import Path
 
 # Initialize detector once
 detector = MTCNN()
 
 # Directory to store cropped faces
-FACE_DIR = "storage/faces"
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+FACE_DIR = BASE_DIR / "storage" / "face_images"
+FACE_DIR.mkdir(parents=True, exist_ok=True)
+
 os.makedirs(FACE_DIR, exist_ok=True)
 
 
