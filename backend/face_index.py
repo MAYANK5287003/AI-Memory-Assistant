@@ -6,8 +6,14 @@ import os
 import pickle
 
 EMBEDDING_DIM = 512
-INDEX_PATH = "storage/face_faiss.index"
-META_PATH = "storage/face_faiss_meta.pkl"
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+STORAGE_DIR = BASE_DIR / "storage"
+
+INDEX_PATH = str(STORAGE_DIR / "face_faiss.index")
+META_PATH = str(STORAGE_DIR / "face_faiss_meta.pkl")
+
 
 # In-memory mappings
 face_ids = []  # index -> face_id

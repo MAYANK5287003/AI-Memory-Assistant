@@ -6,10 +6,15 @@ from sqlalchemy import text
 from pathlib import Path
 import numpy as np
 
+# ⭐ UPDATED
+import shutil
+from datetime import datetime
+
 # =========================
 # CORE MODULES
 # =========================
 from db import engine
+from init_db import init_db
 from ai import get_embedding
 from text_cleaner import clean_text
 from file_text_extractor import (
@@ -61,8 +66,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "storage" / "uploads"
 FACE_IMG_DIR = BASE_DIR / "storage" / "face_images"
 
+# ⭐ UPDATED — new folder for FULL photos
+PHOTO_DIR = BASE_DIR / "storage" / "photos"
+
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 FACE_IMG_DIR.mkdir(parents=True, exist_ok=True)
+PHOTO_DIR.mkdir(parents=True, exist_ok=True)  # ⭐ UPDATED
 
 app.mount(
     "/files/uploads",
@@ -75,6 +84,15 @@ app.mount(
     name="face_images",
 )
 
+# ⭐ UPDATED — serve full images
+app.mount(
+    "/files/photos",
+    StaticFiles(directory=PHOTO_DIR),
+    name="photos",
+)
+
+#make database tables
+init_db()
 # Build FAISS at startup
 build_faiss_index()
 
@@ -156,7 +174,7 @@ def text_search_pipeline(query: str):
         "evidence": {
         "document_id": best_row.document_id,
         "filename": best_row.filename,
-        "file_url": f"http://127.0.0.1:8000/files/{best_row.filename}",
+        "file_url": f"http://127.0.0.1:8000/files/uploads/{best_row.filename}",
         "file_type": (
             "image" if best_row.filename.lower().endswith((".png", ".jpg", ".jpeg"))
             else "pdf" if best_row.filename.lower().endswith(".pdf")
@@ -173,7 +191,9 @@ def text_search_pipeline(query: str):
 # =========================
 @app.post("/face/upload")
 async def upload_face(file: UploadFile = File(...)):
-    image_path = FACE_IMG_DIR / file.filename
+
+    # ⭐ UPDATED — save FULL image in photos folder
+    image_path = PHOTO_DIR / file.filename
 
     with open(image_path, "wb") as f:
         f.write(await file.read())
@@ -187,7 +207,6 @@ async def upload_face(file: UploadFile = File(...)):
     if emb is None:
         return {"error": "Face embedding failed"}
 
-    # 🔍 search existing faces
     results = search_similar_faces(face_index, emb, top_k=1)
 
     label = None
@@ -196,7 +215,6 @@ async def upload_face(file: UploadFile = File(...)):
     if results and results[0]["similarity"] > 0.75:
         unmatched = False
 
-        # 🔥 IMPORTANT: reuse existing label
         with engine.connect() as conn:
             row = conn.execute(
                 text("SELECT label FROM faces WHERE id=:id"),
@@ -206,19 +224,19 @@ async def upload_face(file: UploadFile = File(...)):
             if row:
                 label = row[0]
 
-    # ✅ ALWAYS store new photo
     add_face_embedding(face_index, face["face_id"], emb)
 
     with engine.connect() as conn:
         conn.execute(
             text("""
-                INSERT INTO faces (id, image_path, label)
-                VALUES (:id, :path, :label)
+                INSERT INTO faces (id, image_path, label, created_at)
+                VALUES (:id, :path, :label, :time)
             """),
             {
                 "id": face["face_id"],
-                "path": face["face_path"],
+                "path": str(image_path),   # ⭐ UPDATED — FULL image saved
                 "label": label,
+                "time": datetime.utcnow().isoformat()  # ⭐ UPDATED
             },
         )
         conn.commit()
@@ -237,14 +255,37 @@ class FaceLabelRequest(BaseModel):
 @app.post("/face/label")
 def label_face(req: FaceLabelRequest):
     with engine.connect() as conn:
-        conn.execute(
-            text("""
-                UPDATE faces
-                SET label = :label
-                WHERE id = :id
-            """),
-            {"label": req.label, "id": req.cluster_id},
-        )
+
+        # ⭐ UPDATED — create folder per label
+        label_folder = PHOTO_DIR / req.label.lower()
+        label_folder.mkdir(parents=True, exist_ok=True)
+
+        row = conn.execute(
+            text("SELECT image_path FROM faces WHERE id=:id"),
+            {"id": req.cluster_id}
+        ).fetchone()
+
+        if row:
+            old_path = Path(row[0])
+            new_path = label_folder / old_path.name
+
+            if old_path.exists():
+                shutil.move(old_path, new_path)
+
+            conn.execute(
+                text("""
+                    UPDATE faces
+                    SET label = :label,
+                        image_path = :path
+                    WHERE id = :id
+                """),
+                {
+                    "label": req.label,
+                    "path": str(new_path),
+                    "id": req.cluster_id
+                },
+            )
+
         conn.commit()
 
     return {"status": "label saved"}
@@ -265,115 +306,7 @@ def search_face_by_label(label: str):
     for r in rows:
         filename = Path(r[0]).name
         images.append(
-            f"http://127.0.0.1:8000/files/face_images/{filename}"
+            f"http://127.0.0.1:8000/files/photos/{label.lower()}/{filename}"  # ⭐ UPDATED
         )
 
     return {"images": images}
-
-
-
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    file_path = UPLOAD_DIR / file.filename
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
-
-    filename = file.filename.lower()
-
-    # 1️⃣ INSERT DOCUMENT
-    with engine.connect() as conn:
-        # detect file type
-        if filename.endswith(".pdf"):
-            file_type = "pdf"
-        elif filename.endswith((".xls", ".xlsx")):
-            file_type = "excel"
-        else:
-            file_type = "image"
-
-        result = conn.execute(
-            text("""
-                INSERT INTO documents (filename, file_path, file_type)
-                VALUES (:f, :p, :t)
-                RETURNING id
-            """),
-            {
-                "f": file.filename,
-                "p": str(file_path),
-                "t": file_type,
-            },
-        )
-
-        document_id = result.scalar()
-        conn.commit()
-
-    texts = []
-
-    if filename.endswith(".pdf"):
-        texts.append(extract_text_from_pdf(str(file_path)))
-
-    elif filename.endswith((".xls", ".xlsx")):
-        texts.append(extract_text_from_excel(str(file_path)))
-
-    else:
-        ocr_chunks = extract_ocr_chunks(str(file_path))
-        texts.extend([c["content"] for c in ocr_chunks])
-
-    # 2️⃣ STORE MEMORIES + LINK
-    with engine.connect() as conn:
-        for t in texts:
-            t = clean_text(t)
-            if len(t) < 20:
-                continue
-
-            result = conn.execute(
-                text("""
-                    INSERT INTO memories (content)
-                    VALUES (:c)
-                    RETURNING id
-                """),
-                {"c": t},
-            )
-            memory_id = result.scalar()
-
-            conn.execute(
-                text("""
-                    INSERT INTO document_memories (document_id, memory_id)
-                    VALUES (:d, :m)
-                """),
-                {"d": document_id, "m": memory_id},
-            )
-
-        conn.commit()
-
-    # 3️⃣ REBUILD FAISS
-    build_faiss_index()
-
-    return {
-        "status": "file processed",
-        "document_id": document_id,
-        "chunks_added": len(texts),
-    }
-
-# =========================
-# SMART QUERY
-# =========================
-class SmartQueryRequest(BaseModel):
-    query: str
-
-@app.post("/smart-query")
-def smart_query(request: SmartQueryRequest):
-    route = query_router.detect_route(request.query)
-
-    if route in (QueryRoute.TEXT, QueryRoute.OCR, QueryRoute.HYBRID):
-        result = text_search_pipeline(request.query)
-
-        return {
-            "route": route,
-            "answer": result["answer"],
-            "evidence": result["evidence"]
-        }
-
-    return {
-        "route": "FACE",
-        "message": "Please upload an image for face search"
-    }
