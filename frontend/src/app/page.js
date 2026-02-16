@@ -94,11 +94,14 @@ export default function Home() {
 
       const data = await res.json();
 
-      if (data.unmatched) {
-        setPendingClusterId(data.cluster_id);
+      const unknownFaces = data.faces.filter(f => f.unmatched);
+
+      if (unknownFaces.length > 0) {
+        setFaceResults(unknownFaces); // show cropped previews
+        setPendingClusterId(null);
         setShowLabelBox(true);
       } else {
-        alert("Face matched existing person ✅");
+        alert("All faces matched existing people ✅");
       }
 
       setFaceFile(null);
@@ -106,6 +109,7 @@ export default function Home() {
       alert("Face upload failed ❌");
     }
   }
+
   async function labelFace() {
     if (!labelName.trim()) return;
 
@@ -222,16 +226,40 @@ export default function Home() {
 
       <button onClick={uploadFace}>Upload Face</button>
 
-      {showLabelBox && (
-        <div style={{ marginTop: "15px" }}>
-          <p>New face detected. Enter name:</p>
+      {showLabelBox && faceResults.map((face, idx) => (
+        <div key={idx} style={{ marginTop: "15px" }}>
+          <p>Unknown face detected:</p>
+
+          {/* cropped face preview */}
+          <img
+            src={face.crop_url}
+            style={{ width: "120px", borderRadius: "6px", marginBottom: "8px" }}
+          />
+
           <input
-            value={labelName}
+            placeholder="Enter name"
             onChange={(e) => setLabelName(e.target.value)}
           />
-          <button onClick={labelFace}>Save Label</button>
+
+          <button
+            onClick={async () => {
+              await fetch(`${BACKEND_URL}/face/label`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  cluster_id: face.face_id,
+                  label: labelName,
+                }),
+              });
+
+              alert("Label saved ✅");
+            }}
+          >
+            Save Label
+          </button>
         </div>
-      )}
+      ))}
+
 
 
       {/* -------- ASK QUESTION -------- */}
@@ -344,7 +372,7 @@ export default function Home() {
             {faceResults.map((img, i) => (
               <img
                 key={i}
-                src={img}
+                src = {img.crop_url || img}
                 style={{ width: "100%", borderRadius: "6px" }}
                 onClick={() => window.open(img, "_blank")}
               />

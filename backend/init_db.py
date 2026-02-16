@@ -1,6 +1,5 @@
 from sqlalchemy import text
 from db import engine
-from db import engine
 print("ENGINE URL:", engine.url)
 
 
