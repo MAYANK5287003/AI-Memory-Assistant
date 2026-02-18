@@ -12,7 +12,8 @@ def init_db():
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            content TEXT
+            content TEXT,
+            document_id INTEGER DEFAULT NULL
         );
         """))
 

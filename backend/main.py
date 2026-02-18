@@ -6,7 +6,10 @@ from sqlalchemy import text
 from pathlib import Path
 import numpy as np
 import shutil
+import os
+from fastapi import HTTPException
 from datetime import datetime
+from fastapi.middleware.cors import CORSMiddleware
 
 
 # =========================
@@ -47,14 +50,14 @@ from query_router import SmartQueryRouter, QueryRoute
 # APP SETUP
 # =========================
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:8080"],   # for development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # =========================
 # INIT SYSTEMS
@@ -112,6 +115,7 @@ class MemoryRequest(BaseModel):
 
 @app.post("/memory")
 def add_memory(request: MemoryRequest):
+    print(request)
     with engine.connect() as conn:
         conn.execute(
             text("INSERT INTO memories (content) VALUES (:c)"),
@@ -187,7 +191,7 @@ def text_search_pipeline(query: str):
 
     return {
         "answer": best_row.content,
-        "evidence": evidence
+        "evidence": [evidence] if evidence else []
     }
     
 
@@ -268,7 +272,7 @@ async def upload_face(file: UploadFile = File(...)):
             "face_id": face["face_id"],
             "unmatched": unmatched,
             "label": label,
-            "crop_url": f"http://127.0.0.1:8000/files/face_images/{Path(face['face_path']).name}"
+            "image_url": f"http://127.0.0.1:8000/files/face_images/{Path(face['face_path']).name}"
         })
 
     save_index(face_index)
@@ -326,7 +330,7 @@ def search_face_by_label(label: str):
     with engine.connect() as conn:
         rows = conn.execute(
             text("""
-                SELECT image_path
+                SELECT image_path, label,id
                 FROM faces
                 WHERE LOWER(label) = LOWER(:label)
             """),
@@ -335,13 +339,15 @@ def search_face_by_label(label: str):
 
     images = []
     for r in rows:
-        filename = Path(r[0]).name
-        images.append(
-            f"http://127.0.0.1:8000/files/photos/{label.lower()}/{filename}"
-        )
+        filename = Path(r.image_path).name
+        images.append({
+            "face_id": r.id,   
+            "label": r.label,
+            "image_url": f"http://127.0.0.1:8000/files/photos/{r.label.lower()}/{filename}"           
+        })
 
 
-    return {"images": images}
+    return  images
 
 
 
@@ -413,10 +419,11 @@ async def upload_file(file: UploadFile = File(...)):
 
             result = conn.execute(
                 text("""
-                    INSERT INTO memories (content)
-                    VALUES (:c)
+                    INSERT INTO memories (content, document_id)
+                    VALUES (:c, :doc_id)
+
                 """),
-                {"c": t},
+                {"c": t, "doc_id": document_id},
             )
             memory_id = result.lastrowid
 
@@ -462,3 +469,151 @@ def smart_query(request: SmartQueryRequest):
         "route": "FACE",
         "message": "Please upload an image for face search"
     }
+
+
+
+@app.get("/documents")
+def get_documents():
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT * FROM documents"))
+        rows = result.fetchall()
+
+    docs = []
+
+    for r in rows:
+        filename = Path(r.file_path).name if r.file_path else None
+
+        docs.append({
+            "document_id": str(r.id),     # frontend expects document_id
+            "filename": r.filename,
+            "type": r.file_type,          # rename file_type → type
+            "created_at": None,           # you don't have date column
+            "file_url": f"http://127.0.0.1:8000/files/uploads/{filename}" if filename else None
+        })
+
+    return docs
+
+
+@app.get("/face/folders")
+def get_face_folders():
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT label, image_path
+            FROM faces
+            WHERE label IS NOT NULL
+        """)).fetchall()
+
+    folders = {}
+
+    for r in rows:
+        label = r.label.lower()
+        filename = Path(r.image_path).name
+
+        url = f"http://127.0.0.1:8000/files/photos/{label}/{filename}"
+
+        if label not in folders:
+            folders[label] = []
+
+        folders[label].append(url)
+
+    # Convert into frontend-friendly structure
+    result = []
+
+    for label, images in folders.items():
+        result.append({
+            "label": label,
+            "preview_url": images[0],   # first image as folder preview
+            "count": len(images)
+        })
+
+    return result
+
+
+@app.delete("/document/{document_id}")
+def delete_document(document_id: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT file_path FROM documents WHERE id = :id"),
+            {"id": document_id},
+        ).fetchone()
+
+        if not row:
+            return {"error": "Document not found"}
+
+        file_path = row.file_path
+
+        # Remove file from disk
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+
+        # Remove from SQL
+        conn.execute(
+            text("DELETE FROM document_memories WHERE document_id = :id"),
+            {"id": document_id},
+        )
+        conn.execute(
+            text("DELETE FROM memories WHERE document_id = :id"),
+            {"id": document_id},
+        )
+
+        conn.execute(
+            text("DELETE FROM documents WHERE id = :id"),
+            {"id": document_id},
+        )
+        conn.commit()
+
+    # rebuild FAISS after deletion
+    build_faiss_index()
+
+    return {"status": "deleted"}
+
+@app.get("/document/{document_id}/share")
+def share_document(document_id: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT file_path FROM documents WHERE id = :id"),
+            {"id": document_id},
+        ).fetchone()
+
+    if not row:
+        return {"error": "Not found"}
+
+    filename = Path(row.file_path).name
+
+    return {
+        "share_url": f"http://127.0.0.1:8000/files/uploads/{filename}"
+    }
+
+@app.delete("/faces/{face_id}")
+async def delete_face(face_id: str):
+    with engine.begin() as conn:
+
+        row = conn.execute(
+            text("SELECT image_path FROM faces WHERE id=:id"),
+            {"id": face_id}
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Face not found")
+
+        image_path = row.image_path
+
+        # delete DB record
+        conn.execute(
+            text("DELETE FROM faces WHERE id=:id"),
+            {"id": face_id}
+        )
+        conn.commit()
+
+    # remove file from storage
+    if image_path and os.path.exists(image_path):
+        os.remove(image_path)
+
+    return {"message": "Face deleted"}
+
+
+
+
+
+
+
